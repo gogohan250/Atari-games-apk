@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">Atari Classics</string>
+    <string name="nav_home">الرئيسية</string>
+    <string name="nav_library">المكتبة</string>
+    <string name="nav_favorites">المفضلة</string>
+    <string name="nav_browser">تحميل ألعاب</string>
+    <string name="nav_settings">الإعدادات</string>
+    <string name="search_placeholder">ابحث عن لعبة...</string>
+    <string name="continue_playing">أكمل اللعب</string>
+    <string name="play_action">تشغيل</string>
+    <string name="recently_added">ألعاب مضافة حديثاً</string>
+    <string name="most_played">الأكثر لعباً</string>
+</resources>

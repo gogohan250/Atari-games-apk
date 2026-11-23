@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="atari_bg">#FF0B0B12</color>
+    <color name="atari_surface">#FF181826</color>
+    <color name="atari_orange">#FFFF5A1F</color>
+    <color name="atari_amber">#FFFFB000</color>
+    <color name="atari_red">#FFD62828</color>
+    <color name="atari_cyan">#FF00E5FF</color>
+</resources>

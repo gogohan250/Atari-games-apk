@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <files-path name="roms" path="roms/" />
+    <files-path name="saves" path="saves/" />
+    <files-path name="screenshots" path="screenshots/" />
+    <files-path name="backups" path="backups/" />
+    <cache-path name="share_cache" path="/" />
+</paths>

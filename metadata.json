@@ -1,0 +1,6 @@
+{
+  "name": "Atari Classics",
+  "description": "محاكي ألعاب أتاري الكلاسيكية (2600 / 5200 / 7800 / Lynx / Jaguar) يعمل أوفلاين بسرعة 60fps مع متصفح تحميل داخلي.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
