@@ -1,6 +1,7 @@
 package com.example.ui
 
 import android.app.Application
+import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -29,6 +30,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 enum class LibrarySortMode { TITLE, MOST_PLAYED, NEWEST }
+
+data class RomImportProgress(
+    val processed: Int,
+    val total: Int,
+    val importedCount: Int
+)
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -124,6 +131,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _toastMessage = MutableStateFlow<String?>(null)
     val toastMessage: StateFlow<String?> = _toastMessage.asStateFlow()
 
+    private val _romImportProgress = MutableStateFlow<RomImportProgress?>(null)
+    val romImportProgress: StateFlow<RomImportProgress?> = _romImportProgress.asStateFlow()
+
     init {
         viewModelScope.launch {
             repository.ensureCatalogLoaded().collect { progress ->
@@ -204,6 +214,55 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } else {
                 postToast("تعذّر قراءة ملف ROM أو صيغته غير مدعومة")
+            }
+        }
+    }
+
+    fun importMultipleRoms(uris: List<Uri>, onSingleAutoLaunch: () -> Unit = {}) {
+        if (uris.isEmpty()) return
+        viewModelScope.launch {
+            _romImportProgress.value = RomImportProgress(processed = 0, total = uris.size, importedCount = 0)
+            try {
+                val imported = repository.importMultipleRoms(uris) { imp, proc, total ->
+                    _romImportProgress.value = RomImportProgress(processed = proc, total = total, importedCount = imp)
+                }
+                if (imported.size == 1 && uris.size == 1) {
+                    val one = imported.first()
+                    postToast("تمت إضافة ${one.title} (${one.system})")
+                    launchGame(one, onSingleAutoLaunch)
+                } else if (imported.isNotEmpty()) {
+                    _sortMode.value = LibrarySortMode.NEWEST
+                    postToast("تمت إضافة ${imported.size} لعبة بنجاح")
+                } else {
+                    postToast("تعذّر قراءة ملفات ROM أو صيغتها غير مدعومة")
+                }
+            } finally {
+                _romImportProgress.value = null
+            }
+        }
+    }
+
+    fun importRomFolder(treeUri: Uri) {
+        viewModelScope.launch {
+            runCatching {
+                app.contentResolver.takePersistableUriPermission(
+                    treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            _romImportProgress.value = RomImportProgress(processed = 0, total = 0, importedCount = 0)
+            try {
+                val count = repository.importRomFolder(treeUri) { imp, proc, total ->
+                    _romImportProgress.value = RomImportProgress(processed = proc, total = total, importedCount = imp)
+                }
+                if (count > 0) {
+                    _sortMode.value = LibrarySortMode.NEWEST
+                    postToast("تم استيراد $count لعبة من المجلد بنجاح")
+                } else {
+                    postToast("لم يتم العثور على ألعاب جديدة صالحة في المجلد")
+                }
+            } finally {
+                _romImportProgress.value = null
             }
         }
     }

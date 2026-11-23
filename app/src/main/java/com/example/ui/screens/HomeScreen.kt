@@ -230,7 +230,11 @@ fun HomeScreen(
                                         color = Color.White
                                     )
                                     Text(
-                                        text = "a26 • bin • a78 • a52 • lnx • j64 • zip",
+                                        text = if (isArabic) {
+                                            "ملفات متعددة أو مجلد كامل • a26 • bin • a78 • zip"
+                                        } else {
+                                            "Multiple files or full folder • a26 • bin • a78 • zip"
+                                        },
                                         fontFamily = ChakraPetchFontFamily,
                                         fontSize = 12.sp,
                                         color = AtariTextSecondary

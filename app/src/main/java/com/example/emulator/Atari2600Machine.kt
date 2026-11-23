@@ -16,19 +16,29 @@ data class ControllerInput(
 
 /**
  * Genuine Atari 2600 (Stella-compatible) Hardware Machine:
- * MOS 6507 CPU + TIA (160x192 NTSC Video + 2ch Polynomial Audio + Collisions) + RIOT 6532 + F8/F6/F4 Bankswitching.
+ * - MOS 6507 CPU (including undocumented opcodes)
+ * - Cycle-exact beam-racing TIA (3 color clocks/cycle, asymmetric playfields, mid-line color/sprite splits)
+ * - Auto PAL/NTSC detection + 128-color NTSC & PAL palettes + full PAL vertical framing
+ * - RIOT 6532 + F8/F6/F4 Bankswitching + Superchip 128B RAM auto-detection + Hardware Collisions
  */
 class Atari2600Machine(
     private val romBytes: ByteArray,
-    private val audioEngine: AtariAudioEngine
+    private val audioEngine: AtariAudioEngine,
+    private val isPalHint: Boolean = false
 ) {
     companion object {
         const val WIDTH = 160
         const val HEIGHT = 192
+        private const val RAW_MAX_LINES = 320
+        private const val CLOCKS_PER_LINE = 228
+        private const val HBLANK_CLOCKS = 68
     }
 
     val frameBuffer = IntArray(WIDTH * HEIGHT)
+    private val rawFrame = IntArray(WIDTH * RAW_MAX_LINES)
     val ram = IntArray(128) // RIOT 6532 RAM ($80-$FF)
+    private val superchipRam = IntArray(128)
+    private var hasSuperchip = false
 
     private var currentBank = 0
     private val bankCount = when {
@@ -45,6 +55,8 @@ class Atari2600Machine(
     // TIA registers
     private var vsync = 0
     private var vblank = 0
+    private var inpt4Latched = false
+    private var inpt5Latched = false
     private var wsyncHalted = false
     private var nusiz0 = 0
     private var nusiz1 = 0
@@ -106,12 +118,21 @@ class Atari2600Machine(
     private var riotDivider = 0
     private var riotUnderflow = false
 
-    // Scanline tracking
-    private var cycleInLine = 0
+    // Beam & PAL/NTSC framing
+    private var clockInLine = 0
     private var beamLine = 0
     private var frameEndedByVsync = false
-    private var visibleLineStart = 37
+    private var vblankOffLine = if (isPalHint) 45 else 37
+    private var vblankOnLine = if (isPalHint) 273 else 229
     private var vblankClearedThisFrame = false
+    private var vblankSetThisFrame = false
+    private var detectedPal = isPalHint
+    private var palVoteCount = 0
+
+    // Queued TIA writes during a single 6502 instruction
+    private val pendingReg = IntArray(4)
+    private val pendingVal = IntArray(4)
+    private var pendingCount = 0
 
     // Active cheats: Map<RAM_Address_00_FF, Value>
     @Volatile var activeCheats: Map<Int, Int> = emptyMap()
@@ -122,19 +143,54 @@ class Atari2600Machine(
     )
 
     init {
+        detectCartridgeFeatures()
         reset()
+    }
+
+    private fun detectCartridgeFeatures() {
+        if (bankCount >= 2 && romBytes.size >= 256) {
+            val first = romBytes[0]
+            hasSuperchip = (0 until 128).all { romBytes[it] == first }
+        } else {
+            hasSuperchip = false
+        }
+    }
+
+    private fun pickInitialBootBank(): Int {
+        if (bankCount <= 1 || romBytes.size < 4096) return 0
+        fun resetVecForBank(bank: Int): Int {
+            val base = bank * 4096
+            if (base + 0xFFD >= romBytes.size) return 0
+            val lo = romBytes[base + 0xFFC].toInt() and 0xFF
+            val hi = romBytes[base + 0xFFD].toInt() and 0xFF
+            return lo or (hi shl 8)
+        }
+        val b0 = resetVecForBank(0)
+        if ((b0 and 0x1000) != 0) return 0
+        for (b in (bankCount - 1) downTo 0) {
+            if ((resetVecForBank(b) and 0x1000) != 0) return b
+        }
+        return bankCount - 1
     }
 
     fun reset() {
         ram.fill(0)
+        superchipRam.fill(0)
         frameBuffer.fill(0xFF000000.toInt())
-        currentBank = 0
+        rawFrame.fill(0xFF000000.toInt())
+        currentBank = pickInitialBootBank()
         vsync = 0
         vblank = 0
+        inpt4Latched = false
+        inpt5Latched = false
         wsyncHalted = false
+        clockInLine = 0
         beamLine = 0
-        visibleLineStart = 37
+        vblankOffLine = if (isPalHint) 45 else 37
+        vblankOnLine = if (isPalHint) 273 else 229
         vblankClearedThisFrame = false
+        vblankSetThisFrame = false
+        pendingCount = 0
         audc0 = 0; audf0 = 0; audv0 = 0
         audc1 = 0; audf1 = 0; audv1 = 0
         audioEngine.setChannel0(0, 0, 0)
@@ -153,8 +209,11 @@ class Atari2600Machine(
 
     private fun readRom(offset: Int): Int {
         if (romBytes.isEmpty()) return 0xEA
-        val bankBase = currentBank * 4096
         val inBank = if (romBytes.size <= 2048) offset and 0x07FF else offset and 0x0FFF
+        if (hasSuperchip && inBank in 0x080..0x0FF) {
+            return superchipRam[inBank - 0x080]
+        }
+        val bankBase = currentBank * 4096
         val idx = (bankBase + inBank).coerceIn(0, romBytes.lastIndex)
         return romBytes[idx].toInt() and 0xFF
     }
@@ -175,7 +234,11 @@ class Atari2600Machine(
             return readRom(a13)
         }
         if ((a13 and 0x0080) == 0) {
-            // TIA Read ($00-$0D)
+            // Update latches if needed
+            if ((vblank and 0x40) != 0) {
+                if (p1Input.fireA || p1Input.fireB) inpt4Latched = true
+                if (p2Input.fireA || p2Input.fireB) inpt5Latched = true
+            }
             return when (a13 and 0x0F) {
                 0x00 -> cxm0p
                 0x01 -> cxm1p
@@ -185,8 +248,14 @@ class Atari2600Machine(
                 0x05 -> cxm1fb
                 0x06 -> cxblpf
                 0x07 -> cxppmm
-                0x0C -> if (p1Input.fireA || p1Input.fireB) 0x00 else 0x80 // INPT4
-                0x0D -> if (p2Input.fireA || p2Input.fireB) 0x00 else 0x80 // INPT5
+                0x0C -> {
+                    val active = p1Input.fireA || p1Input.fireB || ((vblank and 0x40) != 0 && inpt4Latched)
+                    if (active) 0x00 else 0x80
+                }
+                0x0D -> {
+                    val active = p2Input.fireA || p2Input.fireB || ((vblank and 0x40) != 0 && inpt5Latched)
+                    if (active) 0x00 else 0x80
+                }
                 else -> 0x00
             }
         }
@@ -194,7 +263,6 @@ class Atari2600Machine(
             val ramAddr = a13 and 0x7F
             return activeCheats[0x80 + ramAddr] ?: ram[ramAddr]
         }
-        // RIOT I/O & Timer ($280-$297)
         return when (a13 and 0x07) {
             0x00 -> buildSwcha()
             0x02 -> buildSwchb()
@@ -212,10 +280,18 @@ class Atari2600Machine(
         val v = value and 0xFF
         if ((a13 and 0x1000) != 0) {
             checkBankSwitch(a13)
+            val off = a13 and 0x0FFF
+            if (hasSuperchip && off in 0x000..0x07F) {
+                superchipRam[off] = v
+            }
             return
         }
         if ((a13 and 0x0080) == 0) {
-            writeTia(a13 and 0x3F, v)
+            if (pendingCount < pendingReg.size) {
+                pendingReg[pendingCount] = a13 and 0x3F
+                pendingVal[pendingCount] = v
+                pendingCount++
+            }
             return
         }
         if ((a13 and 0x0200) == 0) {
@@ -223,7 +299,6 @@ class Atari2600Machine(
             ram[ramAddr] = activeCheats[0x80 + ramAddr] ?: v
             return
         }
-        // RIOT Timer writes
         when (a13 and 0x1F) {
             0x14 -> { riotTimer = v; riotInterval = 1; riotDivider = 0; riotUnderflow = false }
             0x15 -> { riotTimer = v; riotInterval = 8; riotDivider = 0; riotUnderflow = false }
@@ -234,12 +309,10 @@ class Atari2600Machine(
 
     private fun buildSwcha(): Int {
         var res = 0xFF
-        // P0 high nibble
         if (p1Input.up) res = res and 0xEF
         if (p1Input.down) res = res and 0xDF
         if (p1Input.left) res = res and 0xBF
         if (p1Input.right) res = res and 0x7F
-        // P1 low nibble
         if (p2Input.up) res = res and 0xFE
         if (p2Input.down) res = res and 0xFD
         if (p2Input.left) res = res and 0xFB
@@ -248,35 +321,56 @@ class Atari2600Machine(
     }
 
     private fun buildSwchb(): Int {
-        var res = 0x0B // Color TV (bit 3=1), Difficulty A/B
-        if (!p1Input.reset) res = res or 0x01 else res = res and 0xFE
-        if (!p1Input.select && !p1Input.start) res = res or 0x02 else res = res and 0xFD
+        var res = 0x0B // Color TV, Difficulty A/B
+        if (!p1Input.reset && !p1Input.start) res = res or 0x01 else res = res and 0xFE
+        if (!p1Input.select) res = res or 0x02 else res = res and 0xFD
         return res
     }
 
-    private fun currentVisibleX(): Int {
-        val colorClocks = cycleInLine * 3
-        return (colorClocks - 68 + 5).coerceIn(0, WIDTH - 1)
+    private fun currentVisibleX(): Int =
+        if (clockInLine < HBLANK_CLOCKS) 2 else (clockInLine - HBLANK_CLOCKS + 5) % WIDTH
+
+    private fun wrapX(x: Int): Int {
+        val m = x % WIDTH
+        return if (m < 0) m + WIDTH else m
     }
 
-    private fun writeTia(reg: Int, v: Int) {
+    private fun applyTiaWrite(reg: Int, v: Int) {
         when (reg) {
             0x00 -> {
                 val turningOn = (v and 0x02) != 0 && (vsync and 0x02) == 0
                 val turningOff = (v and 0x02) == 0 && (vsync and 0x02) != 0
                 if (turningOn && beamLine > 180) {
                     frameEndedByVsync = true
+                    if (beamLine >= 288) {
+                        palVoteCount++
+                        if (palVoteCount >= 2) detectedPal = true
+                    } else {
+                        palVoteCount = 0
+                        if (!isPalHint) detectedPal = false
+                    }
                 }
                 if (turningOff) {
                     beamLine = 0
                     vblankClearedThisFrame = false
+                    vblankSetThisFrame = false
                 }
                 vsync = v
             }
             0x01 -> {
-                if ((v and 0x02) == 0 && (vblank and 0x02) != 0 && !vblankClearedThisFrame) {
-                    visibleLineStart = beamLine.coerceIn(10, 60)
+                val turningOff = (v and 0x02) == 0 && (vblank and 0x02) != 0
+                val turningOn = (v and 0x02) != 0 && (vblank and 0x02) == 0
+                if (turningOff && !vblankClearedThisFrame && beamLine in 8..90) {
+                    vblankOffLine = beamLine
                     vblankClearedThisFrame = true
+                }
+                if (turningOn && !vblankSetThisFrame && beamLine > 160) {
+                    vblankOnLine = beamLine
+                    vblankSetThisFrame = true
+                }
+                if ((v and 0x40) == 0) {
+                    inpt4Latched = false
+                    inpt5Latched = false
                 }
                 vblank = v
             }
@@ -324,14 +418,20 @@ class Atari2600Machine(
             0x25 -> vdelp0 = v
             0x26 -> vdelp1 = v
             0x27 -> vdelbl = v
-            0x28 -> resmp0 = v
-            0x29 -> resmp1 = v
+            0x28 -> {
+                resmp0 = v
+                if ((v and 0x02) != 0) m0x = wrapX(p0x + 4)
+            }
+            0x29 -> {
+                resmp1 = v
+                if ((v and 0x02) != 0) m1x = wrapX(p1x + 4)
+            }
             0x2A -> { // HMOVE
-                p0x = (p0x - hmp0).coerceIn(0, WIDTH - 1)
-                p1x = (p1x - hmp1).coerceIn(0, WIDTH - 1)
-                m0x = (m0x - hmm0).coerceIn(0, WIDTH - 1)
-                m1x = (m1x - hmm1).coerceIn(0, WIDTH - 1)
-                blx = (blx - hmbl).coerceIn(0, WIDTH - 1)
+                p0x = wrapX(p0x - hmp0)
+                p1x = wrapX(p1x - hmp1)
+                m0x = if ((resmp0 and 0x02) != 0) wrapX(p0x + 4) else wrapX(m0x - hmm0)
+                m1x = if ((resmp1 and 0x02) != 0) wrapX(p1x + 4) else wrapX(m1x - hmm1)
+                blx = wrapX(blx - hmbl)
             }
             0x2B -> {
                 hmp0 = 0; hmp1 = 0; hmm0 = 0; hmm1 = 0; hmbl = 0
@@ -358,44 +458,29 @@ class Atari2600Machine(
         }
     }
 
-    fun stepFrame() {
-        frameEndedByVsync = false
-        var safetyLines = 0
-        while (!frameEndedByVsync && safetyLines < 312) {
-            cycleInLine = 0
-            wsyncHalted = false
-            while (cycleInLine < 76) {
-                if (wsyncHalted) {
-                    val rem = 76 - cycleInLine
-                    tickRiotTimer(rem)
-                    cycleInLine = 76
-                } else {
-                    val cyc = cpu.step()
-                    cycleInLine += cyc
-                    tickRiotTimer(cyc)
-                }
-            }
-            val visibleY = beamLine - visibleLineStart
-            if (visibleY in 0 until HEIGHT) {
-                renderScanline(visibleY)
-            }
-            beamLine++
-            safetyLines++
-        }
-    }
+    private fun advanceClocks(clocks: Int) {
+        val startClock = clockInLine
+        val endClock = startClock + clocks
+        clockInLine = endClock
 
-    private fun renderScanline(y: Int) {
-        val rowOffset = y * WIDTH
+        if (beamLine !in 0 until RAW_MAX_LINES) return
+        val visStart = startClock.coerceAtLeast(HBLANK_CLOCKS)
+        val visEnd = endClock.coerceAtMost(CLOCKS_PER_LINE)
+        if (visStart >= visEnd) return
+
+        val rowOffset = beamLine * WIDTH
         if ((vblank and 0x02) != 0) {
             val blk = 0xFF000000.toInt()
-            for (x in 0 until WIDTH) frameBuffer[rowOffset + x] = blk
+            for (c in visStart until visEnd) {
+                rawFrame[rowOffset + (c - HBLANK_CLOCKS)] = blk
+            }
             return
         }
 
-        val bgArgb = AtariNTSCColors.color(colubk)
-        val pfArgb = AtariNTSCColors.color(colupf)
-        val p0Argb = AtariNTSCColors.color(colup0)
-        val p1Argb = AtariNTSCColors.color(colup1)
+        val bgArgb = AtariNTSCColors.color(colubk, detectedPal)
+        val pfArgb = AtariNTSCColors.color(colupf, detectedPal)
+        val p0Argb = AtariNTSCColors.color(colup0, detectedPal)
+        val p1Argb = AtariNTSCColors.color(colup1, detectedPal)
         val reflectPf = (ctrlpf and 0x01) != 0
         val scoreMode = (ctrlpf and 0x02) != 0
         val pfPriority = (ctrlpf and 0x04) != 0
@@ -403,29 +488,27 @@ class Atari2600Machine(
         val g0 = if ((vdelp0 and 1) != 0) grp0Old else grp0
         val g1 = if ((vdelp1 and 1) != 0) grp1Old else grp1
         val ballOn = ((if ((vdelbl and 1) != 0) enablOld else enabl) and 0x02) != 0
+        val ballSize = 1 shl ((ctrlpf shr 4) and 0x03)
         val m0On = (enam0 and 0x02) != 0 && (resmp0 and 0x02) == 0
         val m1On = (enam1 and 0x02) != 0 && (resmp1 and 0x02) == 0
+        val m0Size = 1 shl ((nusiz0 shr 4) and 0x03)
+        val m1Size = 1 shl ((nusiz1 shr 4) and 0x03)
+        val p0Nusiz = nusiz0 and 0x07
+        val p1Nusiz = nusiz1 and 0x07
+        val p0Scale = when (p0Nusiz) { 5 -> 2; 7 -> 4; else -> 1 }
+        val p1Scale = when (p1Nusiz) { 5 -> 2; 7 -> 4; else -> 1 }
+        val p0Ref = (refp0 and 0x08) != 0
+        val p1Ref = (refp1 and 0x08) != 0
 
-        val p0Scale = when (nusiz0 and 0x07) {
-            5 -> 2
-            7 -> 4
-            else -> 1
-        }
-        val p1Scale = when (nusiz1 and 0x07) {
-            5 -> 2
-            7 -> 4
-            else -> 1
-        }
-
-        for (x in 0 until WIDTH) {
+        for (c in visStart until visEnd) {
+            val x = c - HBLANK_CLOCKS
             val pfBit = samplePlayfieldBit(x, reflectPf)
-            val p0Bit = samplePlayerBit(x, p0x, g0, (refp0 and 0x08) != 0, p0Scale, nusiz0 and 0x07)
-            val p1Bit = samplePlayerBit(x, p1x, g1, (refp1 and 0x08) != 0, p1Scale, nusiz1 and 0x07)
-            val m0Bit = m0On && x in m0x until (m0x + 2)
-            val m1Bit = m1On && x in m1x until (m1x + 2)
-            val blBit = ballOn && x in blx until (blx + 2)
+            val p0Bit = g0 != 0 && samplePlayerBit(x, p0x, g0, p0Ref, p0Scale, p0Nusiz)
+            val p1Bit = g1 != 0 && samplePlayerBit(x, p1x, g1, p1Ref, p1Scale, p1Nusiz)
+            val m0Bit = m0On && sampleMissileBit(x, m0x, m0Size, p0Nusiz)
+            val m1Bit = m1On && sampleMissileBit(x, m1x, m1Size, p1Nusiz)
+            val blBit = ballOn && sampleWrappedSpan(x, blx, ballSize)
 
-            // Update hardware collisions
             if (m0Bit && p1Bit) cxm0p = cxm0p or 0x80
             if (m0Bit && p0Bit) cxm0p = cxm0p or 0x40
             if (m1Bit && p0Bit) cxm1p = cxm1p or 0x80
@@ -456,17 +539,82 @@ class Atari2600Machine(
                     else -> bgArgb
                 }
             }
-            frameBuffer[rowOffset + x] = pixel
+            rawFrame[rowOffset + x] = pixel
+        }
+    }
+
+    fun stepFrame() {
+        frameEndedByVsync = false
+        var safetyLines = 0
+        while (!frameEndedByVsync && safetyLines < 322) {
+            wsyncHalted = false
+            while (clockInLine < CLOCKS_PER_LINE) {
+                if (wsyncHalted) {
+                    val remClocks = CLOCKS_PER_LINE - clockInLine
+                    val remCycles = (remClocks + 2) / 3
+                    tickRiotTimer(remCycles)
+                    advanceClocks(remClocks)
+                } else {
+                    pendingCount = 0
+                    val cyc = cpu.step()
+                    tickRiotTimer(cyc)
+                    if (pendingCount == 0) {
+                        advanceClocks(cyc * 3)
+                    } else {
+                        if (cyc > 1) advanceClocks((cyc - 1) * 3)
+                        for (i in 0 until pendingCount) {
+                            applyTiaWrite(pendingReg[i], pendingVal[i])
+                        }
+                        pendingCount = 0
+                        advanceClocks(3)
+                    }
+                }
+            }
+            clockInLine -= CLOCKS_PER_LINE
+            beamLine++
+            safetyLines++
+        }
+
+        // Frame finalization: fit active scanline window cleanly into 160x192 (full PAL + NTSC support)
+        val startLine = vblankOffLine.coerceIn(16, 62)
+        val defaultEnd = startLine + if (detectedPal) 228 else HEIGHT
+        val endLine = if (vblankOnLine > startLine + 140) {
+            vblankOnLine.coerceAtMost(RAW_MAX_LINES)
+        } else {
+            defaultEnd.coerceAtMost(RAW_MAX_LINES)
+        }
+        val activeHeight = (endLine - startLine).coerceIn(HEIGHT, 250)
+
+        for (y in 0 until HEIGHT) {
+            val srcLine = (startLine + (y * activeHeight) / HEIGHT).coerceIn(0, RAW_MAX_LINES - 1)
+            System.arraycopy(rawFrame, srcLine * WIDTH, frameBuffer, y * WIDTH, WIDTH)
         }
     }
 
     private fun samplePlayfieldBit(x: Int, reflect: Boolean): Boolean {
-        val pfPix = x / 4 // 0..39
+        val pfPix = x / 4
         val col = if (pfPix < 20) pfPix else if (reflect) 39 - pfPix else pfPix - 20
         return when {
             col < 4 -> (pf0 and (1 shl (4 + col))) != 0
             col < 12 -> (pf1 and (1 shl (11 - col))) != 0
             else -> (pf2 and (1 shl (col - 12))) != 0
+        }
+    }
+
+    private fun sampleWrappedSpan(x: Int, pos: Int, width: Int): Boolean {
+        val rel = wrapX(x - pos)
+        return rel < width
+    }
+
+    private fun sampleMissileBit(x: Int, mx: Int, size: Int, nusiz: Int): Boolean {
+        if (sampleWrappedSpan(x, mx, size)) return true
+        return when (nusiz) {
+            1 -> sampleWrappedSpan(x, (mx + 16) % WIDTH, size)
+            2 -> sampleWrappedSpan(x, (mx + 32) % WIDTH, size)
+            3 -> sampleWrappedSpan(x, (mx + 16) % WIDTH, size) || sampleWrappedSpan(x, (mx + 32) % WIDTH, size)
+            4 -> sampleWrappedSpan(x, (mx + 64) % WIDTH, size)
+            6 -> sampleWrappedSpan(x, (mx + 32) % WIDTH, size) || sampleWrappedSpan(x, (mx + 64) % WIDTH, size)
+            else -> false
         }
     }
 
@@ -478,32 +626,44 @@ class Atari2600Machine(
         scale: Int,
         nusiz: Int
     ): Boolean {
-        if (grp == 0) return false
         val width = 8 * scale
-        val offsets = when (nusiz) {
-            1 -> intArrayOf(0, 16)
-            2 -> intArrayOf(0, 32)
-            3 -> intArrayOf(0, 16, 32)
-            4 -> intArrayOf(0, 64)
-            6 -> intArrayOf(0, 32, 64)
-            else -> intArrayOf(0)
+        if (checkPlayerCopy(x, px, grp, reflect, scale, width)) return true
+        return when (nusiz) {
+            1 -> checkPlayerCopy(x, (px + 16) % WIDTH, grp, reflect, scale, width)
+            2 -> checkPlayerCopy(x, (px + 32) % WIDTH, grp, reflect, scale, width)
+            3 -> checkPlayerCopy(x, (px + 16) % WIDTH, grp, reflect, scale, width) ||
+                checkPlayerCopy(x, (px + 32) % WIDTH, grp, reflect, scale, width)
+            4 -> checkPlayerCopy(x, (px + 64) % WIDTH, grp, reflect, scale, width)
+            6 -> checkPlayerCopy(x, (px + 32) % WIDTH, grp, reflect, scale, width) ||
+                checkPlayerCopy(x, (px + 64) % WIDTH, grp, reflect, scale, width)
+            else -> false
         }
-        for (off in offsets) {
-            val rel = x - (px + off)
-            if (rel in 0 until width) {
-                val bitIdx = rel / scale
-                val mask = if (reflect) (1 shl bitIdx) else (0x80 ushr bitIdx)
-                if ((grp and mask) != 0) return true
-            }
-        }
-        return false
+    }
+
+    private fun checkPlayerCopy(
+        x: Int,
+        copyX: Int,
+        grp: Int,
+        reflect: Boolean,
+        scale: Int,
+        width: Int
+    ): Boolean {
+        val rel = wrapX(x - copyX)
+        if (rel >= width) return false
+        val bitIdx = rel / scale
+        val mask = if (reflect) (1 shl bitIdx) else (0x80 ushr bitIdx)
+        return (grp and mask) != 0
     }
 
     fun serializeState(): ByteArray {
-        val buf = ByteBuffer.allocate(1024)
+        val buf = ByteBuffer.allocate(1600)
         cpu.writeState(buf)
         buf.putInt(currentBank)
+        buf.put(if (detectedPal) 1 else 0)
         for (b in ram) buf.putInt(b)
+        if (hasSuperchip) {
+            for (b in superchipRam) buf.putInt(b)
+        }
         buf.putInt(p0x); buf.putInt(p1x); buf.putInt(m0x); buf.putInt(m1x); buf.putInt(blx)
         buf.putInt(colup0); buf.putInt(colup1); buf.putInt(colupf); buf.putInt(colubk)
         buf.putInt(ctrlpf); buf.putInt(refp0); buf.putInt(refp1)
@@ -520,7 +680,11 @@ class Atari2600Machine(
         val buf = ByteBuffer.wrap(bytes)
         cpu.readState(buf)
         currentBank = buf.int
+        detectedPal = buf.get().toInt() != 0
         for (i in ram.indices) ram[i] = buf.int
+        if (hasSuperchip && buf.remaining() >= 128 * 4) {
+            for (i in superchipRam.indices) superchipRam[i] = buf.int
+        }
         p0x = buf.int; p1x = buf.int; m0x = buf.int; m1x = buf.int; blx = buf.int
         colup0 = buf.int; colup1 = buf.int; colupf = buf.int; colubk = buf.int
         ctrlpf = buf.int; refp0 = buf.int; refp1 = buf.int

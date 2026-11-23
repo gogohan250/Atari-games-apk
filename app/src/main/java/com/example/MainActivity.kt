@@ -38,6 +38,8 @@ import androidx.navigation.compose.rememberNavController
 import com.example.ui.MainViewModel
 import com.example.ui.components.AtariBottomBar
 import com.example.ui.components.MainTab
+import com.example.ui.components.RomImportOptionsDialog
+import com.example.ui.components.RomImportProgressDialog
 import com.example.ui.components.TelegramSubscribeStartupDialog
 import com.example.ui.screens.BrowserScreen
 import com.example.ui.screens.FavoritesScreen
@@ -160,19 +162,29 @@ private fun AtariClassicsRoot(
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val connectedGamepadName by viewModel.gamepadHandler.connectedGamepadName.collectAsStateWithLifecycle()
+    val romImportProgress by viewModel.romImportProgress.collectAsStateWithLifecycle()
     var showTelegramPromptThisSession by remember { mutableStateOf(true) }
+    var showImportOptionsDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(currentRoute) {
         viewModel.isPlayerActive.value = currentRoute == "player"
     }
 
-    val romPickerLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) {
-            viewModel.importRomUri(uri, autoLaunch = true) {
+    val multiRomPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            viewModel.importMultipleRoms(uris) {
                 navController.navigate("player")
             }
+        }
+    }
+
+    val folderRomPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.importRomFolder(uri)
         }
     }
 
@@ -246,7 +258,7 @@ private fun AtariClassicsRoot(
                             },
                             onToggleFavorite = viewModel::toggleFavorite,
                             onImportRomClick = {
-                                romPickerLauncher.launch(arrayOf("*/*"))
+                                showImportOptionsDialog = true
                             },
                             onOpenLibrary = {
                                 navController.navigate(MainTab.LIBRARY.route) {
@@ -280,7 +292,7 @@ private fun AtariClassicsRoot(
                             },
                             onToggleFavorite = viewModel::toggleFavorite,
                             onImportRomClick = {
-                                romPickerLauncher.launch(arrayOf("*/*"))
+                                showImportOptionsDialog = true
                             }
                         )
                     }
@@ -356,6 +368,22 @@ private fun AtariClassicsRoot(
                         }
                     }
                 }
+            }
+
+            if (showImportOptionsDialog) {
+                RomImportOptionsDialog(
+                    isArabic = settings.isArabic,
+                    onDismiss = { showImportOptionsDialog = false },
+                    onSelectMultipleFiles = { multiRomPickerLauncher.launch(arrayOf("*/*")) },
+                    onSelectFolder = { folderRomPickerLauncher.launch(null) }
+                )
+            }
+
+            romImportProgress?.let { progress ->
+                RomImportProgressDialog(
+                    progress = progress,
+                    isArabic = settings.isArabic
+                )
             }
 
             if (showTelegramPromptThisSession && !settings.telegramSubscribed && !isPlayerRoute) {

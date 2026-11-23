@@ -3,7 +3,8 @@ package com.example.emulator
 import java.nio.ByteBuffer
 
 /**
- * Complete MOS 6502 / 6507 CPU Core for Atari 2600 / 5200 / 7800 / 800 emulation.
+ * Complete MOS 6502 / 6507 CPU Core for Atari 2600 / 5200 / 7800 / 800 emulation,
+ * including common undocumented/illegal opcodes used by commercial Atari 2600 kernels.
  */
 class Cpu6502(
     private val readMem: (Int) -> Int,
@@ -384,10 +385,89 @@ class Cpu6502(
             0xB8 -> { setFlag(FLAG_V, false); 2 }
             0xD8 -> { setFlag(FLAG_D, false); 2 }
             0xF8 -> { setFlag(FLAG_D, true); 2 }
-            // NOP & common 2/3-byte undocumented NOPs
+
+            // --- Common Undocumented 6502 Opcodes (Atari 2600 kernels) ---
+            // LAX
+            0xA7 -> { val v = read(zp()); a = setZN(v); x = v; 3 }
+            0xB7 -> { val v = read(zpY()); a = setZN(v); x = v; 4 }
+            0xAF -> { val v = read(abs()); a = setZN(v); x = v; 4 }
+            0xBF -> { val v = read(absY()); a = setZN(v); x = v; 4 }
+            0xA3 -> { val v = read(indX()); a = setZN(v); x = v; 6 }
+            0xB3 -> { val v = read(indY()); a = setZN(v); x = v; 5 }
+            // SAX
+            0x87 -> { write(zp(), a and x); 3 }
+            0x97 -> { write(zpY(), a and x); 4 }
+            0x8F -> { write(abs(), a and x); 4 }
+            0x83 -> { write(indX(), a and x); 6 }
+            // DCP
+            0xC7 -> { val ad = zp(); val v = setZN(read(ad) - 1); write(ad, v); cmp(a, v); 5 }
+            0xD7 -> { val ad = zpX(); val v = setZN(read(ad) - 1); write(ad, v); cmp(a, v); 6 }
+            0xCF -> { val ad = abs(); val v = setZN(read(ad) - 1); write(ad, v); cmp(a, v); 6 }
+            0xDF -> { val ad = absX(); val v = setZN(read(ad) - 1); write(ad, v); cmp(a, v); 7 }
+            0xDB -> { val ad = absY(); val v = setZN(read(ad) - 1); write(ad, v); cmp(a, v); 7 }
+            0xC3 -> { val ad = indX(); val v = setZN(read(ad) - 1); write(ad, v); cmp(a, v); 8 }
+            0xD3 -> { val ad = indY(); val v = setZN(read(ad) - 1); write(ad, v); cmp(a, v); 8 }
+            // ISB / ISC
+            0xE7 -> { val ad = zp(); val v = setZN(read(ad) + 1); write(ad, v); sbc(v); 5 }
+            0xF7 -> { val ad = zpX(); val v = setZN(read(ad) + 1); write(ad, v); sbc(v); 6 }
+            0xEF -> { val ad = abs(); val v = setZN(read(ad) + 1); write(ad, v); sbc(v); 6 }
+            0xFF -> { val ad = absX(); val v = setZN(read(ad) + 1); write(ad, v); sbc(v); 7 }
+            0xFB -> { val ad = absY(); val v = setZN(read(ad) + 1); write(ad, v); sbc(v); 7 }
+            0xE3 -> { val ad = indX(); val v = setZN(read(ad) + 1); write(ad, v); sbc(v); 8 }
+            0xF3 -> { val ad = indY(); val v = setZN(read(ad) + 1); write(ad, v); sbc(v); 8 }
+            // SLO
+            0x07 -> { val ad = zp(); val v = aslVal(read(ad)); write(ad, v); a = setZN(a or v); 5 }
+            0x17 -> { val ad = zpX(); val v = aslVal(read(ad)); write(ad, v); a = setZN(a or v); 6 }
+            0x0F -> { val ad = abs(); val v = aslVal(read(ad)); write(ad, v); a = setZN(a or v); 6 }
+            0x1F -> { val ad = absX(); val v = aslVal(read(ad)); write(ad, v); a = setZN(a or v); 7 }
+            0x1B -> { val ad = absY(); val v = aslVal(read(ad)); write(ad, v); a = setZN(a or v); 7 }
+            0x03 -> { val ad = indX(); val v = aslVal(read(ad)); write(ad, v); a = setZN(a or v); 8 }
+            0x13 -> { val ad = indY(); val v = aslVal(read(ad)); write(ad, v); a = setZN(a or v); 8 }
+            // RLA
+            0x27 -> { val ad = zp(); val v = rolVal(read(ad)); write(ad, v); a = setZN(a and v); 5 }
+            0x37 -> { val ad = zpX(); val v = rolVal(read(ad)); write(ad, v); a = setZN(a and v); 6 }
+            0x2F -> { val ad = abs(); val v = rolVal(read(ad)); write(ad, v); a = setZN(a and v); 6 }
+            0x3F -> { val ad = absX(); val v = rolVal(read(ad)); write(ad, v); a = setZN(a and v); 7 }
+            0x3B -> { val ad = absY(); val v = rolVal(read(ad)); write(ad, v); a = setZN(a and v); 7 }
+            0x23 -> { val ad = indX(); val v = rolVal(read(ad)); write(ad, v); a = setZN(a and v); 8 }
+            0x33 -> { val ad = indY(); val v = rolVal(read(ad)); write(ad, v); a = setZN(a and v); 8 }
+            // SRE
+            0x47 -> { val ad = zp(); val v = lsrVal(read(ad)); write(ad, v); a = setZN(a xor v); 5 }
+            0x57 -> { val ad = zpX(); val v = lsrVal(read(ad)); write(ad, v); a = setZN(a xor v); 6 }
+            0x4F -> { val ad = abs(); val v = lsrVal(read(ad)); write(ad, v); a = setZN(a xor v); 6 }
+            0x5F -> { val ad = absX(); val v = lsrVal(read(ad)); write(ad, v); a = setZN(a xor v); 7 }
+            0x5B -> { val ad = absY(); val v = lsrVal(read(ad)); write(ad, v); a = setZN(a xor v); 7 }
+            0x43 -> { val ad = indX(); val v = lsrVal(read(ad)); write(ad, v); a = setZN(a xor v); 8 }
+            0x53 -> { val ad = indY(); val v = lsrVal(read(ad)); write(ad, v); a = setZN(a xor v); 8 }
+            // RRA
+            0x67 -> { val ad = zp(); val v = rorVal(read(ad)); write(ad, v); adc(v); 5 }
+            0x77 -> { val ad = zpX(); val v = rorVal(read(ad)); write(ad, v); adc(v); 6 }
+            0x6F -> { val ad = abs(); val v = rorVal(read(ad)); write(ad, v); adc(v); 6 }
+            0x7F -> { val ad = absX(); val v = rorVal(read(ad)); write(ad, v); adc(v); 7 }
+            0x7B -> { val ad = absY(); val v = rorVal(read(ad)); write(ad, v); adc(v); 7 }
+            0x63 -> { val ad = indX(); val v = rorVal(read(ad)); write(ad, v); adc(v); 8 }
+            0x73 -> { val ad = indY(); val v = rorVal(read(ad)); write(ad, v); adc(v); 8 }
+            // ANC, ALR, ARR, SBX
+            0x0B, 0x2B -> { a = setZN(a and fetchByte()); setFlag(FLAG_C, (a and 0x80) != 0); 2 }
+            0x4B -> { a = lsrVal(a and fetchByte()); 2 }
+            0x6B -> {
+                a = rorVal(a and fetchByte())
+                setFlag(FLAG_C, (a and 0x40) != 0)
+                setFlag(FLAG_V, ((a and 0x40) shr 6) xor ((a and 0x20) shr 5) != 0)
+                2
+            }
+            0xCB -> {
+                val imm = fetchByte()
+                val ax = a and x
+                setFlag(FLAG_C, ax >= imm)
+                x = setZN((ax - imm) and 0xFF)
+                2
+            }
+            // NOP & 1/2/3-byte undocumented NOPs
             0xEA, 0x1A, 0x3A, 0x5A, 0x7A, 0xDA, 0xFA -> 2
-            0x04, 0x44, 0x64, 0x80 -> { fetchByte(); 3 }
-            0x0C -> { fetchWord(); 4 }
+            0x04, 0x14, 0x34, 0x44, 0x54, 0x64, 0x74,
+            0x80, 0x82, 0x89, 0xC2, 0xD4, 0xE2, 0xF4 -> { fetchByte(); 3 }
+            0x0C, 0x1C, 0x3C, 0x5C, 0x7C, 0xDC, 0xFC -> { fetchWord(); 4 }
             else -> 2
         }
         totalCycles += cycles

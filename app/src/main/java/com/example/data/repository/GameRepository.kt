@@ -90,9 +90,17 @@ class GameRepository(private val context: Context) {
     }
 
     suspend fun importRomFromUri(uri: Uri, overrideFileName: String? = null): GameEntity? = withContext(Dispatchers.IO) {
+        importAllRomsFromUri(uri, overrideFileName).firstOrNull()
+    }
+
+    suspend fun importAllRomsFromUri(
+        uri: Uri,
+        overrideFileName: String? = null,
+        skipExistingSuffixes: Set<String>? = null
+    ): List<GameEntity> = withContext(Dispatchers.IO) {
         val rawName = overrideFileName ?: resolveFileName(uri) ?: "imported_${System.currentTimeMillis()}.a26"
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return@withContext null
-        importRomBytes(rawName, bytes)
+        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return@withContext emptyList()
+        importAllRomsFromBytes(rawName, bytes, skipExistingSuffixes)
     }
 
     suspend fun importRomFromFile(file: File): GameEntity? = withContext(Dispatchers.IO) {
@@ -101,118 +109,218 @@ class GameRepository(private val context: Context) {
     }
 
     suspend fun importRomBytes(fileName: String, rawBytes: ByteArray): GameEntity? = withContext(Dispatchers.IO) {
+        importAllRomsFromBytes(fileName, rawBytes).firstOrNull()
+    }
+
+    private suspend fun importAllRomsFromBytes(
+        fileName: String,
+        rawBytes: ByteArray,
+        skipExistingSuffixes: Set<String>? = null
+    ): List<GameEntity> = withContext(Dispatchers.IO) {
         val ext = fileName.substringAfterLast('.', "").lowercase()
-        var finalName = fileName
-        var finalBytes = rawBytes
-
-        if (ext == "zip") {
-            val extracted = extractFirstRomFromZip(rawBytes) ?: return@withContext null
-            finalName = extracted.first
-            finalBytes = extracted.second
+        val entries: List<Pair<String, ByteArray>> = if (ext == "zip") {
+            extractAllRomsFromZip(rawBytes)
+        } else {
+            if (ext !in AtariSystem.supportedExtensions) return@withContext emptyList()
+            listOf(fileName to rawBytes)
         }
-
-        val romExt = finalName.substringAfterLast('.', "").lowercase()
-        if (romExt !in AtariSystem.supportedExtensions && ext != "zip") {
-            return@withContext null
-        }
-
-        val detectedSystem = AtariSystem.fromExtension(romExt)
-        val cleanTitle = finalName.substringBeforeLast('.')
-            .replace('_', ' ')
-            .replace('-', ' ')
-            .trim()
-            .ifBlank { "Atari ROM" }
-            .uppercase()
-
-        val id = "user_${UUID.randomUUID().toString().take(8)}"
-        val destFile = File(romsDir, "${id}_${finalName.replace(Regex("[^A-Za-z0-9._-]"), "_")}")
-        FileOutputStream(destFile).use { it.write(finalBytes) }
+        if (entries.isEmpty()) return@withContext emptyList()
 
         val palette = listOf("#FF5A1F", "#0088CC", "#7C3AED", "#15803D", "#DC2628", "#EAB308", "#00B4D8")
-        val game = GameEntity(
-            id = id,
-            title = cleanTitle,
-            system = detectedSystem.name,
-            year = when (detectedSystem) {
-                AtariSystem.ATARI_2600 -> 1982
-                AtariSystem.ATARI_5200 -> 1983
-                AtariSystem.ATARI_7800 -> 1987
-                AtariSystem.ATARI_LYNX -> 1990
-                AtariSystem.ATARI_JAGUAR -> 1994
-                AtariSystem.ATARI_800 -> 1984
-            },
-            genre = "مستورد",
-            colorHex = palette[kotlin.math.abs(cleanTitle.hashCode()) % palette.size],
-            localRomPath = destFile.absolutePath,
-            isFavorite = false,
-            addedAt = System.currentTimeMillis()
-        )
-        val coverPath = CoverGenerator.ensureCoverCached(context, game)
-        val withCover = game.copy(coverPath = coverPath)
-        gameDao.insert(withCover)
-        withCover
-    }
+        val imported = mutableListOf<GameEntity>()
+        val now = System.currentTimeMillis()
 
-    private fun extractFirstRomFromZip(zipBytes: ByteArray): Pair<String, ByteArray>? {
-        ZipInputStream(BufferedInputStream(zipBytes.inputStream())).use { zis ->
-            var entry: ZipEntry? = zis.nextEntry
-            var fallbackEntry: Pair<String, ByteArray>? = null
-            while (entry != null) {
-                if (!entry.isDirectory) {
-                    val name = entry.name.substringAfterLast('/')
-                    val ext = name.substringAfterLast('.', "").lowercase()
-                    if (ext in AtariSystem.supportedExtensions) {
-                        return name to zis.readBytes()
-                    }
-                    if (fallbackEntry == null && ext.isNotBlank()) {
-                        fallbackEntry = name to zis.readBytes()
-                    }
-                }
-                zis.closeEntry()
-                entry = zis.nextEntry
+        for ((entryName, entryBytes) in entries) {
+            val romExt = entryName.substringAfterLast('.', "").lowercase()
+            if (romExt !in AtariSystem.supportedExtensions && ext != "zip") continue
+            if (entryBytes.isEmpty()) continue
+
+            val sanitizedFileName = entryName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+            if (skipExistingSuffixes != null && sanitizedFileName in skipExistingSuffixes) {
+                continue
             }
-            return fallbackEntry
+
+            val detectedSystem = AtariSystem.fromExtension(romExt)
+            val cleanTitle = entryName.substringBeforeLast('.')
+                .replace('_', ' ')
+                .replace('-', ' ')
+                .trim()
+                .ifBlank { "Atari ROM" }
+                .uppercase()
+
+            val id = "user_${UUID.randomUUID().toString().take(8)}"
+            val destFile = File(romsDir, "${id}_${sanitizedFileName}")
+            FileOutputStream(destFile).use { it.write(entryBytes) }
+
+            val game = GameEntity(
+                id = id,
+                title = cleanTitle,
+                system = detectedSystem.name,
+                year = when (detectedSystem) {
+                    AtariSystem.ATARI_2600 -> 1982
+                    AtariSystem.ATARI_5200 -> 1983
+                    AtariSystem.ATARI_7800 -> 1987
+                    AtariSystem.ATARI_LYNX -> 1990
+                    AtariSystem.ATARI_JAGUAR -> 1994
+                    AtariSystem.ATARI_800 -> 1984
+                },
+                genre = "مستورد",
+                colorHex = palette[kotlin.math.abs(cleanTitle.hashCode()) % palette.size],
+                localRomPath = destFile.absolutePath,
+                isFavorite = false,
+                addedAt = now + imported.size
+            )
+            val coverPath = CoverGenerator.ensureCoverCached(context, game)
+            val withCover = game.copy(coverPath = coverPath)
+            gameDao.insert(withCover)
+            imported.add(withCover)
         }
+        imported
     }
 
-    suspend fun scanWatchedSafTree(treeUriString: String): Int = withContext(Dispatchers.IO) {
-        if (treeUriString.isBlank()) return@withContext 0
-        val treeUri = Uri.parse(treeUriString)
-        var importedCount = 0
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
-            treeUri,
-            DocumentsContract.getTreeDocumentId(treeUri)
-        )
-        val existingPaths = gameDao.getAllSnapshot().map { it.localRomPath }.toSet()
-        context.contentResolver.query(
-            childrenUri,
-            arrayOf(
-                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                DocumentsContract.Document.COLUMN_MIME_TYPE
-            ),
-            null,
-            null,
-            null
-        )?.use { cursor ->
-            val idCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-            val nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-            while (cursor.moveToNext()) {
-                val docId = cursor.getString(idCol)
-                val name = cursor.getString(nameCol) ?: continue
-                val ext = name.substringAfterLast('.', "").lowercase()
-                if (ext in AtariSystem.supportedExtensions || ext == "zip") {
-                    val alreadyImported = existingPaths.any { it.endsWith(name.replace(Regex("[^A-Za-z0-9._-]"), "_")) }
-                    if (!alreadyImported) {
-                        val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
-                        if (importRomFromUri(docUri, name) != null) {
-                            importedCount++
+    private fun extractAllRomsFromZip(zipBytes: ByteArray): List<Pair<String, ByteArray>> {
+        val supported = mutableListOf<Pair<String, ByteArray>>()
+        var fallbackEntry: Pair<String, ByteArray>? = null
+        runCatching {
+            ZipInputStream(BufferedInputStream(zipBytes.inputStream())).use { zis ->
+                var entry: ZipEntry? = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val name = entry.name.substringAfterLast('/')
+                        val ext = name.substringAfterLast('.', "").lowercase()
+                        if (ext in AtariSystem.supportedExtensions) {
+                            supported.add(name to zis.readBytes())
+                        } else if (fallbackEntry == null && ext.isNotBlank()) {
+                            fallbackEntry = name to zis.readBytes()
+                        }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+        }
+        if (supported.isNotEmpty()) return supported
+        return listOfNotNull(fallbackEntry)
+    }
+
+    private suspend fun existingImportedFileSuffixes(): MutableSet<String> {
+        val suffixes = HashSet<String>()
+        gameDao.getAllSnapshot().forEach { g ->
+            val path = g.localRomPath
+            if (path.isNotBlank()) {
+                val fileName = File(path).name
+                // Strip "user_xxxxxxxx_" prefix if present
+                val stripped = if (fileName.startsWith("user_") && fileName.length > 14 && fileName[13] == '_') {
+                    fileName.substring(14)
+                } else {
+                    fileName
+                }
+                suffixes.add(stripped)
+            }
+        }
+        return suffixes
+    }
+
+    suspend fun collectRomUrisFromTree(treeUri: Uri): List<Pair<Uri, String>> = withContext(Dispatchers.IO) {
+        val results = mutableListOf<Pair<Uri, String>>()
+        val queue = ArrayDeque<String>()
+        val visited = HashSet<String>()
+        val rootDocId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
+            ?: return@withContext emptyList()
+        queue.add(rootDocId)
+        visited.add(rootDocId)
+
+        while (queue.isNotEmpty()) {
+            val parentDocId = queue.removeFirst()
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+            runCatching {
+                context.contentResolver.query(
+                    childrenUri,
+                    arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE
+                    ),
+                    null,
+                    null,
+                    null
+                )?.use { cursor ->
+                    val idCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val mimeCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    while (cursor.moveToNext()) {
+                        val docId = (if (idCol >= 0) cursor.getString(idCol) else null) ?: continue
+                        val name = (if (nameCol >= 0) cursor.getString(nameCol) else null) ?: continue
+                        val mime = if (mimeCol >= 0) cursor.getString(mimeCol) else null
+                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                            if (visited.add(docId)) {
+                                queue.add(docId)
+                            }
+                        } else {
+                            val ext = name.substringAfterLast('.', "").lowercase()
+                            if (ext in AtariSystem.supportedExtensions || ext == "zip") {
+                                val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                                results.add(docUri to name)
+                            }
                         }
                     }
                 }
             }
         }
+        results.sortBy { it.second.lowercase() }
+        results
+    }
+
+    suspend fun importMultipleRoms(
+        uris: List<Uri>,
+        onProgress: (imported: Int, processed: Int, total: Int) -> Unit = { _, _, _ -> }
+    ): List<GameEntity> = withContext(Dispatchers.IO) {
+        val importedGames = mutableListOf<GameEntity>()
+        val total = uris.size
+        if (total == 0) return@withContext emptyList()
+        onProgress(0, 0, total)
+        uris.forEachIndexed { idx, uri ->
+            val added = runCatching { importAllRomsFromUri(uri) }.getOrDefault(emptyList())
+            importedGames.addAll(added)
+            onProgress(importedGames.size, idx + 1, total)
+        }
+        importedGames
+    }
+
+    suspend fun importRomFolder(
+        treeUri: Uri,
+        onProgress: (imported: Int, processed: Int, total: Int) -> Unit = { _, _, _ -> }
+    ): Int = withContext(Dispatchers.IO) {
+        val romEntries = collectRomUrisFromTree(treeUri)
+        val total = romEntries.size
+        if (total == 0) return@withContext 0
+        val existingSuffixes = existingImportedFileSuffixes()
+        var importedCount = 0
+        onProgress(0, 0, total)
+        romEntries.forEachIndexed { idx, (docUri, name) ->
+            val added = runCatching {
+                importAllRomsFromUri(docUri, name, existingSuffixes)
+            }.getOrDefault(emptyList())
+            if (added.isNotEmpty()) {
+                importedCount += added.size
+                val sanitized = name.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                existingSuffixes.add(sanitized)
+                added.forEach { g ->
+                    val fn = File(g.localRomPath).name
+                    if (fn.startsWith("user_") && fn.length > 14 && fn[13] == '_') {
+                        existingSuffixes.add(fn.substring(14))
+                    }
+                }
+            }
+            onProgress(importedCount, idx + 1, total)
+        }
         importedCount
+    }
+
+    suspend fun scanWatchedSafTree(treeUriString: String): Int = withContext(Dispatchers.IO) {
+        if (treeUriString.isBlank()) return@withContext 0
+        val treeUri = Uri.parse(treeUriString)
+        importRomFolder(treeUri)
     }
 
     fun getSaveFile(gameId: String, slotIndex: Int): File =

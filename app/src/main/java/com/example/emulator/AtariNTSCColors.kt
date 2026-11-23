@@ -1,7 +1,7 @@
 package com.example.emulator
 
 /**
- * Authentic 128-color Atari 2600 NTSC TIA Palette (ARGB8888).
+ * Authentic 128-color Atari 2600 NTSC & PAL TIA Palettes (ARGB8888).
  * Index by (tiaColorByte ushr 1) and 0x7F.
  */
 object AtariNTSCColors {
@@ -40,5 +40,60 @@ object AtariNTSCColors {
         0xFFB17800.toInt(), 0xFFD79C0C.toInt(), 0xFFFDC22D.toInt(), 0xFFFFEA51.toInt()
     )
 
-    fun color(tiaByte: Int): Int = palette[(tiaByte ushr 1) and 0x7F]
+    // Authentic 128-color PAL TIA Palette (grayscale on $0x/$1x/$Ex/$Fx, shifted hues for $2x..$Dx)
+    val palPalette: IntArray = intArrayOf(
+        // $0x grayscale
+        0xFF000000.toInt(), 0xFF1A1A1A.toInt(), 0xFF393939.toInt(), 0xFF5B5B5B.toInt(),
+        0xFF7E7E7E.toInt(), 0xFFA2A2A2.toInt(), 0xFFC7C7C7.toInt(), 0xFFEDEDED.toInt(),
+        // $1x grayscale on PAL
+        0xFF000000.toInt(), 0xFF1A1A1A.toInt(), 0xFF393939.toInt(), 0xFF5B5B5B.toInt(),
+        0xFF7E7E7E.toInt(), 0xFFA2A2A2.toInt(), 0xFFC7C7C7.toInt(), 0xFFEDEDED.toInt(),
+        // $2x gold / yellow-orange
+        0xFF271700.toInt(), 0xFF483500.toInt(), 0xFF6B5600.toInt(), 0xFF8F7900.toInt(),
+        0xFFB59D00.toInt(), 0xFFDBC21A.toInt(), 0xFFFFE83D.toInt(), 0xFFFFFF64.toInt(),
+        // $3x yellow-green
+        0xFF0D2100.toInt(), 0xFF294300.toInt(), 0xFF496600.toInt(), 0xFF6C8A07.toInt(),
+        0xFF8FB024.toInt(), 0xFFB4D643.toInt(), 0xFFD9FC66.toInt(), 0xFFFFFF89.toInt(),
+        // $4x orange / brown
+        0xFF3A0400.toInt(), 0xFF611C00.toInt(), 0xFF863A00.toInt(), 0xFFAC5B0C.toInt(),
+        0xFFD27D28.toInt(), 0xFFF8A148.toInt(), 0xFFFFC66B.toInt(), 0xFFFFEC90.toInt(),
+        // $5x green
+        0xFF002B00.toInt(), 0xFF004B00.toInt(), 0xFF126E0B.toInt(), 0xFF2D9323.toInt(),
+        0xFF4DBA41.toInt(), 0xFF70E062.toInt(), 0xFF93FF85.toInt(), 0xFFB8FFA9.toInt(),
+        // $6x red
+        0xFF4A0004.toInt(), 0xFF750016.toInt(), 0xFF9A0E32.toInt(), 0xFFC02B52.toInt(),
+        0xFFE64B73.toInt(), 0xFFFF6E97.toInt(), 0xFFFF92BA.toInt(), 0xFFFFB7DF.toInt(),
+        // $7x cyan-green
+        0xFF002B0D.toInt(), 0xFF004C2B.toInt(), 0xFF00704C.toInt(), 0xFF08956E.toInt(),
+        0xFF25BB92.toInt(), 0xFF45E2B7.toInt(), 0xFF69FFDC.toInt(), 0xFF8FFFFF.toInt(),
+        // $8x magenta / purple
+        0xFF3B0036.toInt(), 0xFF62005D.toInt(), 0xFF870B84.toInt(), 0xFFAC27A8.toInt(),
+        0xFFD148CE.toInt(), 0xFFF76AF3.toInt(), 0xFFFF8EFF.toInt(), 0xFFFFB4FF.toInt(),
+        // $9x cyan
+        0xFF002032.toInt(), 0xFF004057.toInt(), 0xFF00647D.toInt(), 0xFF0488A2.toInt(),
+        0xFF20AEC7.toInt(), 0xFF41D4ED.toInt(), 0xFF65FBFF.toInt(), 0xFF8BFFFF.toInt(),
+        // $Ax violet / blue-purple
+        0xFF1E005A.toInt(), 0xFF3E008D.toInt(), 0xFF6010B5.toInt(), 0xFF832DD9.toInt(),
+        0xFFA74EFB.toInt(), 0xFFCC70FF.toInt(), 0xFFF094FF.toInt(), 0xFFFFB9FF.toInt(),
+        // $Bx light blue
+        0xFF000D57.toInt(), 0xFF002988.toInt(), 0xFF054BB0.toInt(), 0xFF1D6FD4.toInt(),
+        0xFF3D94F6.toInt(), 0xFF5FB9FF.toInt(), 0xFF84DFFF.toInt(), 0xFFA9FFFF.toInt(),
+        // $Cx indigo / deep blue
+        0xFF00006B.toInt(), 0xFF09069D.toInt(), 0xFF2520C5.toInt(), 0xFF443EE7.toInt(),
+        0xFF6660FF.toInt(), 0xFF8A84FF.toInt(), 0xFFAFA9FF.toInt(), 0xFFD5D0FF.toInt(),
+        // $Dx royal blue
+        0xFF000069.toInt(), 0xFF00129B.toInt(), 0xFF0330C2.toInt(), 0xFF1A52E5.toInt(),
+        0xFF3876FF.toInt(), 0xFF599BFF.toInt(), 0xFF7DC1FF.toInt(), 0xFFA2E7FF.toInt(),
+        // $Ex grayscale on PAL
+        0xFF000000.toInt(), 0xFF1A1A1A.toInt(), 0xFF393939.toInt(), 0xFF5B5B5B.toInt(),
+        0xFF7E7E7E.toInt(), 0xFFA2A2A2.toInt(), 0xFFC7C7C7.toInt(), 0xFFEDEDED.toInt(),
+        // $Fx grayscale on PAL
+        0xFF000000.toInt(), 0xFF1A1A1A.toInt(), 0xFF393939.toInt(), 0xFF5B5B5B.toInt(),
+        0xFF7E7E7E.toInt(), 0xFFA2A2A2.toInt(), 0xFFC7C7C7.toInt(), 0xFFEDEDED.toInt()
+    )
+
+    fun color(tiaByte: Int, isPal: Boolean = false): Int {
+        val idx = (tiaByte ushr 1) and 0x7F
+        return if (isPal) palPalette[idx] else palette[idx]
+    }
 }

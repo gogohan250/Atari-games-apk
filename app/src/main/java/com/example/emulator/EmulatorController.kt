@@ -127,7 +127,8 @@ class EmulatorController(
             }
             is2600Rom -> {
                 classicGame = null
-                atari2600 = Atari2600Machine(romBytes, audioEngine)
+                val isPalHint = game.title.contains("PAL", ignoreCase = true)
+                atari2600 = Atari2600Machine(romBytes, audioEngine, isPalHint = isPalHint)
                 extendedCore = null
             }
             else -> {
